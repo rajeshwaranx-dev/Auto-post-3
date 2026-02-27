@@ -1,0 +1,34 @@
+# render.yaml — Deploy on Render.com (https://render.com)
+services:
+  - type: worker
+    name: telegram-autopost-bot
+    env: python
+    region: singapore          # choose closest to your users
+    plan: starter              # $7/month — enough for a bot
+    buildCommand: |
+      pip install -r requirements.txt
+      mkdir -p posters assets/fonts
+    startCommand: python main.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false            # set manually in Render dashboard
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: SOURCE_CHANNEL_ID
+        sync: false
+      - key: DEST_CHANNEL_ID
+        sync: false
+      - key: TMDB_API_KEY
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: MONGO_DB_NAME
+        value: autopostbot
+      - key: POSTER_OUTPUT_DIR
+        value: /tmp/posters
+    disk:
+      name: posters
+      mountPath: /tmp/posters
+      sizeGB: 1
