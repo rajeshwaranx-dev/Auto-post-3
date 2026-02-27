@@ -15,8 +15,8 @@ class Config:
     API_HASH: str         = os.environ["API_HASH"]
 
     # Channel IDs (use -100xxxxxxxxxx format for public channels)
-    SOURCE_CHANNEL_ID: int = int(os.environ["SOURCE_CHANNEL_ID"])
-    DEST_CHANNEL_ID: int   = int(os.environ["DEST_CHANNEL_ID"])
+    SOURCE_CHANNEL_ID = os.environ["SOURCE_CHANNEL_ID"]  # str username OR int id
+    DEST_CHANNEL_ID = os.environ["DEST_CHANNEL_ID"]  # str username OR int id
 
     # ── TMDB ──────────────────────────────────────────────────────────────────
     TMDB_API_KEY: str     = os.environ["TMDB_API_KEY"]
@@ -36,3 +36,15 @@ class Config:
     FALLBACK_POSTER: str  = "assets/fallback.jpg"
     FONT_BOLD: str        = "assets/fonts/bold.ttf"
     FONT_REGULAR: str     = "assets/fonts/regular.ttf"
+
+def _parse_channel(value: str):
+    """Return int if purely numeric, else keep as string (@username or link)."""
+    v = value.strip()
+    try:
+        return int(v)
+    except ValueError:
+        return v  # @username or t.me/... link
+
+# Re-parse after class definition
+Config.SOURCE_CHANNEL_ID = _parse_channel(os.environ["SOURCE_CHANNEL_ID"])
+Config.DEST_CHANNEL_ID   = _parse_channel(os.environ["DEST_CHANNEL_ID"])
