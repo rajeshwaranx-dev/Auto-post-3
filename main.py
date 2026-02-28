@@ -5,9 +5,13 @@
 import asyncio
 import logging
 import os
+from aiohttp import web
 from pyrogram import Client, filters, idle, raw
 from pyrogram.types import Message
 from pyrogram.handlers import RawUpdateHandler
+
+from modules.font_setup import ensure_fonts
+ensure_fonts()  # Download fonts before anything else
 
 from modules.config import Config
 from modules.database import Database
@@ -40,6 +44,23 @@ RESOLVED_SOURCE = None
 RESOLVED_DEST   = None
 
 
+# ── Health check web server (keeps Koyeb/Heroku happy) ───────────────────────
+async def health_check(request):
+    return web.Response(text="OK")
+
+async def start_health_server():
+    port = int(os.getenv("PORT", 8000))
+    web_app = web.Application()
+    web_app.router.add_get("/", health_check)
+    web_app.router.add_get("/health", health_check)
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info("✅ Health server running on port %s", port)
+
+
+# ── Channel resolver ──────────────────────────────────────────────────────────
 async def resolve_channel(client, raw_id, label):
     if isinstance(raw_id, str) and "t.me/" in raw_id:
         raw_id = "@" + raw_id.split("t.me/")[-1].strip("/")
@@ -48,20 +69,15 @@ async def resolve_channel(client, raw_id, label):
         logger.info("✅ %s resolved: '%s' (id=%s)", label, chat.title, chat.id)
         return chat
     except Exception as e:
-        logger.error("❌ %s failed to resolve '%s': %s", label, raw_id, e)
+        logger.error("❌ %s failed '%s': %s", label, raw_id, e)
         return None
 
 
-# ── RAW UPDATE HANDLER — shows every single MTProto update ───────────────────
+# ── Raw update debugger ───────────────────────────────────────────────────────
 async def raw_update_handler(client, update, users, chats):
     update_type = type(update).__name__
-    # Only log channel-related updates to avoid noise
     if "Channel" in update_type or "Message" in update_type:
-        logger.info("📡 RAW UPDATE: %s", update_type)
-        # If it's a message update, log the chat id
-        if hasattr(update, "message") and hasattr(update.message, "peer_id"):
-            peer = update.message.peer_id
-            logger.info("   peer_id type=%s value=%s", type(peer).__name__, peer)
+        logger.info("📡 RAW: %s", update_type)
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
@@ -69,69 +85,61 @@ async def raw_update_handler(client, update, users, chats):
 async def cmd_start(client, message: Message):
     ok_s = "✅" if RESOLVED_SOURCE else "❌"
     ok_d = "✅" if RESOLVED_DEST   else "❌"
-    src_name  = RESOLVED_SOURCE.title if RESOLVED_SOURCE else "NOT RESOLVED"
-    dest_name = RESOLVED_DEST.title   if RESOLVED_DEST   else "NOT RESOLVED"
     await message.reply(
         f"🤖 **Bot alive!**\n\n"
-        f"{ok_s} Source: `{src_name}`\n"
-        f"{ok_d} Dest:   `{dest_name}`\n\n"
-        f"/ping — test posting to dest\n"
-        f"/test — manually trigger a test post"
+        f"{ok_s} Source: `{RESOLVED_SOURCE.title if RESOLVED_SOURCE else 'NOT RESOLVED'}`\n"
+        f"{ok_d} Dest:   `{RESOLVED_DEST.title if RESOLVED_DEST else 'NOT RESOLVED'}`\n\n"
+        f"/ping — test dest channel\n/test — send test post"
     )
 
 
-# ── /ping — post test message to dest ────────────────────────────────────────
+# ── /ping ─────────────────────────────────────────────────────────────────────
 @app.on_message(filters.private & filters.command("ping"))
 async def cmd_ping(client, message: Message):
     if not RESOLVED_DEST:
-        await message.reply("❌ Dest channel not resolved.")
+        await message.reply("❌ Dest not resolved.")
         return
     try:
         await client.send_message(RESOLVED_DEST.id, "🏓 Ping — dest works!")
-        await message.reply("✅ Ping sent to dest channel!")
+        await message.reply("✅ Ping sent!")
     except Exception as e:
-        await message.reply(f"❌ Failed: `{e}`")
+        await message.reply(f"❌ `{e}`")
 
 
-# ── /test — simulate a file post with a dummy filename ───────────────────────
+# ── /test ─────────────────────────────────────────────────────────────────────
 @app.on_message(filters.private & filters.command("test"))
 async def cmd_test(client, message: Message):
-    """Simulate processing a file — bypasses source channel filter."""
     if not RESOLVED_DEST:
-        await message.reply("❌ Dest channel not resolved.")
+        await message.reply("❌ Dest not resolved.")
         return
     try:
-        dummy_filename = "Beast.Games.S02E06.720p.WEB-DL.mkv"
-        meta = parser.parse(dummy_filename)
+        meta        = parser.parse("Beast.Games.S02E06.720p.WEB-DL.mkv")
         tmdb_data   = await tmdb.search(meta["title"], meta.get("year"), meta["media_type"])
         poster_path = await poster_gen.create_poster(meta, tmdb_data)
         caption, keyboard = formatter.build(meta, message)
         await client.send_photo(
             chat_id=RESOLVED_DEST.id,
             photo=poster_path,
-            caption=f"🧪 TEST POST\n\n{caption}",
+            caption=f"🧪 TEST\n\n{caption}",
             reply_markup=keyboard,
         )
-        await message.reply("✅ Test post sent to dest channel!")
+        await message.reply("✅ Test post sent!")
     except Exception as e:
         logger.exception("Test failed")
-        await message.reply(f"❌ Test failed: `{e}`")
+        await message.reply(f"❌ `{e}`")
 
 
 # ── Main file handler ─────────────────────────────────────────────────────────
 @app.on_message(filters.document | filters.video | filters.audio)
 async def handle_new_file(client, message: Message):
-    if not RESOLVED_SOURCE:
+    if not RESOLVED_SOURCE or message.chat.id != RESOLVED_SOURCE.id:
         return
-    if message.chat.id != RESOLVED_SOURCE.id:
-        return
-
-    logger.info("📥 FILE from source | id=%s | doc=%s | video=%s",
+    logger.info("📥 FILE | id=%s | doc=%s | video=%s",
                 message.id, bool(message.document), bool(message.video))
     try:
         filename = _extract_filename(message)
         if not filename:
-            logger.warning("⚠️  No filename in message %s", message.id)
+            logger.warning("⚠️  No filename in msg %s", message.id)
             return
 
         logger.info("🎬 Processing: %s", filename)
@@ -147,7 +155,6 @@ async def handle_new_file(client, message: Message):
             await db.cache_poster(meta["title"], meta.get("year"), meta["media_type"], poster_path, tmdb_data)
 
         caption, keyboard = formatter.build(meta, message)
-
         await client.send_photo(
             chat_id=RESOLVED_DEST.id,
             photo=poster_path,
@@ -162,7 +169,7 @@ async def handle_new_file(client, message: Message):
         logger.info("✅ Posted '%s'", meta["title"])
 
     except Exception as exc:
-        logger.exception("❌ Error on message %s: %s", message.id, exc)
+        logger.exception("❌ Error on msg %s: %s", message.id, exc)
 
 
 @app.on_message(filters.photo)
@@ -172,7 +179,7 @@ async def handle_manual_poster(client, message: Message):
     if not message.caption:
         return
     await db.save_manual_poster(message.caption.strip(), message.photo.file_id)
-    logger.info("📌 Manual poster saved: %s", message.caption.strip())
+    logger.info("📌 Manual poster: %s", message.caption.strip())
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -192,10 +199,12 @@ def _extract_filename(message: Message) -> str | None:
 async def main():
     global RESOLVED_SOURCE, RESOLVED_DEST
 
+    # Start health check server FIRST so Koyeb doesn't kill us
+    await start_health_server()
+
     await db.connect()
     logger.info("🚀 Bot starting…")
 
-    # Register raw update handler BEFORE starting
     app.add_handler(RawUpdateHandler(raw_update_handler))
 
     async with app:
@@ -206,8 +215,7 @@ async def main():
         RESOLVED_DEST   = await resolve_channel(app, Config.DEST_CHANNEL_ID,   "DEST")
 
         if RESOLVED_SOURCE and RESOLVED_DEST:
-            logger.info("✅ Both channels resolved — bot is ready!")
-            logger.info("📌 SOURCE id=%s | DEST id=%s", RESOLVED_SOURCE.id, RESOLVED_DEST.id)
+            logger.info("✅ Both channels resolved!")
         else:
             logger.error("❌ Channel resolution failed!")
 
@@ -216,5 +224,14 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
-        
+    from pyrogram.errors import FloodWait
+    import time
+    while True:
+        try:
+            asyncio.run(main())
+            break
+        except FloodWait as e:
+            logger.warning("⏳ FloodWait %s sec...", e.value)
+            time.sleep(e.value + 5)
+        except KeyboardInterrupt:
+            break
