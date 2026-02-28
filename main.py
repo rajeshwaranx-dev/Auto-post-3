@@ -1,15 +1,14 @@
 """
-🎬 Telegram Auto Post Bot — Main Entry Point
-Handles channel posts via RawUpdateHandler (the only reliable method for bots)
+🎬 Telegram Auto Post Bot
 """
 
 import asyncio
 import logging
 import os
 from aiohttp import web
-from pyrogram import Client, filters, idle, raw, types, utils
+from pyrogram import Client, filters, idle, raw, utils
 from pyrogram.types import Message
-from pyrogram.handlers import RawUpdateHandler, MessageHandler
+from pyrogram.handlers import RawUpdateHandler
 
 from modules.font_setup import ensure_fonts
 ensure_fonts()
@@ -38,22 +37,19 @@ app = Client(
 db = Database(Config.MONGO_URI)
 tmdb = TMDBClient(Config.TMDB_API_KEY)
 poster_gen = PosterGenerator()
-formatter = PostFormatter()
-parser = FilenameParser()
+formatter  = PostFormatter()
+parser     = FilenameParser()
 
 RESOLVED_SOURCE = None
 RESOLVED_DEST   = None
 
 
-# ── Health check server ───────────────────────────────────────────────────────
-async def health_check(request):
-    return web.Response(text="OK")
-
+# ── Health server ─────────────────────────────────────────────────────────────
 async def start_health_server():
     port = int(os.getenv("PORT", 8000))
     web_app = web.Application()
-    web_app.router.add_get("/", health_check)
-    web_app.router.add_get("/health", health_check)
+    web_app.router.add_get("/", lambda r: web.Response(text="OK"))
+    web_app.router.add_get("/health", lambda r: web.Response(text="OK"))
     runner = web.AppRunner(web_app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", port).start()
@@ -73,32 +69,95 @@ async def resolve_channel(client, raw_id, label):
         return None
 
 
-# ── Core processing logic (shared by raw handler + /test) ────────────────────
-async def process_file(client, filename: str, chat_id: int, message_id: int):
+# ── RAW UPDATE HANDLER ────────────────────────────────────────────────────────
+async def on_raw_update(client, update, users, chats):
+    try:
+        # Log ALL update types so we can see what's arriving
+        utype = type(update).__name__
+        logger.info("📡 RAW UPDATE TYPE: %s", utype)
+
+        if not isinstance(update, raw.types.UpdateNewChannelMessage):
+            return
+
+        msg = update.message
+        logger.info("   msg type: %s", type(msg).__name__)
+
+        if not isinstance(msg, raw.types.Message):
+            return
+
+        peer = msg.peer_id
+        logger.info("   peer type: %s | value: %s", type(peer).__name__, peer)
+
+        if not isinstance(peer, raw.types.PeerChannel):
+            return
+
+        # Convert bare channel id to Pyrogram format (-100xxx)
+        channel_id = utils.get_channel_id(peer.channel_id)
+        logger.info("   channel_id=%s | source_id=%s | match=%s",
+                    channel_id,
+                    RESOLVED_SOURCE.id if RESOLVED_SOURCE else "None",
+                    channel_id == RESOLVED_SOURCE.id if RESOLVED_SOURCE else "N/A")
+
+        if not RESOLVED_SOURCE or channel_id != RESOLVED_SOURCE.id:
+            return
+
+        # Extract filename
+        filename = _extract_filename_from_raw(msg)
+        logger.info("   filename: %s", filename)
+
+        if not filename:
+            logger.info("   → No media filename, skipping")
+            return
+
+        await _process_and_post(client, filename, channel_id, msg.id)
+
+    except Exception as e:
+        logger.exception("❌ Raw handler error: %s", e)
+
+
+def _extract_filename_from_raw(msg) -> str | None:
+    """Extract filename from a raw Pyrogram message."""
+    media = getattr(msg, "media", None)
+    if not media:
+        return None
+
+    doc = None
+    if isinstance(media, raw.types.MessageMediaDocument):
+        doc = media.document
+
+    if doc and isinstance(doc, raw.types.Document):
+        for attr in doc.attributes:
+            if isinstance(attr, raw.types.DocumentAttributeFilename):
+                return attr.file_name
+
+    # Fallback: caption as filename
+    caption = getattr(msg, "message", "") or ""
+    if caption and any(caption.strip().endswith(ext)
+                       for ext in (".mkv", ".mp4", ".avi", ".ts", ".m2ts")):
+        return caption.strip()
+
+    return None
+
+
+async def _process_and_post(client, filename: str, from_chat_id: int, message_id: int):
     logger.info("🎬 Processing: %s", filename)
     meta = parser.parse(filename)
-    logger.info("🔍 title=%s | type=%s | S%sE%s | quality=%s",
-                meta["title"], meta["media_type"],
-                meta.get("season"), meta.get("episode"), meta.get("quality"))
+    logger.info("🔍 title=%s | type=%s | quality=%s",
+                meta["title"], meta["media_type"], meta.get("quality"))
 
     cached = await db.get_cached_poster(meta["title"], meta.get("year"), meta["media_type"])
     if cached and cached.get("poster_path") and os.path.exists(cached["poster_path"]):
         poster_path = cached["poster_path"]
         tmdb_data   = cached.get("tmdb_data", {})
-        logger.info("✅ Cache hit")
     else:
-        logger.info("🌐 Searching TMDB...")
         tmdb_data   = await tmdb.search(meta["title"], meta.get("year"), meta["media_type"])
-        logger.info("🎨 Generating poster...")
         poster_path = await poster_gen.create_poster(meta, tmdb_data)
         await db.cache_poster(meta["title"], meta.get("year"), meta["media_type"], poster_path, tmdb_data)
 
-    # Build a minimal fake message object for formatter
     class FakeMsg:
         id = message_id
     caption, keyboard = formatter.build(meta, FakeMsg())
 
-    logger.info("📤 Sending to dest channel...")
     await client.send_photo(
         chat_id=RESOLVED_DEST.id,
         photo=poster_path,
@@ -107,70 +166,13 @@ async def process_file(client, filename: str, chat_id: int, message_id: int):
     )
     await client.forward_messages(
         chat_id=RESOLVED_DEST.id,
-        from_chat_id=chat_id,
+        from_chat_id=from_chat_id,
         message_ids=message_id,
     )
     logger.info("✅ Posted: '%s'", meta["title"])
 
 
-# ── RAW UPDATE HANDLER — catches ALL Telegram updates including channel posts ─
-async def on_raw_update(client, update, users, chats):
-    try:
-        # Only handle new channel messages
-        if not isinstance(update, raw.types.UpdateNewChannelMessage):
-            return
-
-        msg = update.message
-        if not isinstance(msg, raw.types.Message):
-            return
-
-        # Get channel id from peer
-        peer = msg.peer_id
-        if not isinstance(peer, raw.types.PeerChannel):
-            return
-
-        channel_id = utils.get_channel_id(peer.channel_id)
-        logger.info("📡 Channel post received | channel=%s | msg_id=%s", channel_id, msg.id)
-
-        # Only process from source channel
-        if not RESOLVED_SOURCE or channel_id != RESOLVED_SOURCE.id:
-            logger.info("   → Ignoring (not source channel, source=%s)",
-                        RESOLVED_SOURCE.id if RESOLVED_SOURCE else "None")
-            return
-
-        # Extract filename from media
-        filename = None
-        media = msg.media
-
-        if isinstance(media, raw.types.MessageMediaDocument):
-            doc = media.document
-            if isinstance(doc, raw.types.Document):
-                for attr in doc.attributes:
-                    if isinstance(attr, raw.types.DocumentAttributeFilename):
-                        filename = attr.file_name
-                        break
-                    if isinstance(attr, raw.types.DocumentAttributeVideo):
-                        # Video file — try to get filename from filename attribute
-                        pass
-
-        if not filename:
-            # Try caption as filename
-            if msg.message and any(msg.message.strip().endswith(ext)
-                                   for ext in (".mkv", ".mp4", ".avi", ".ts")):
-                filename = msg.message.strip()
-
-        if not filename:
-            logger.info("   → No filename found, skipping")
-            return
-
-        logger.info("📥 File: %s", filename)
-        await process_file(client, filename, channel_id, msg.id)
-
-    except Exception as e:
-        logger.exception("❌ Raw update error: %s", e)
-
-
-# ── /start ────────────────────────────────────────────────────────────────────
+# ── Commands ──────────────────────────────────────────────────────────────────
 @app.on_message(filters.private & filters.command("start"))
 async def cmd_start(client, message: Message):
     ok_s = "✅" if RESOLVED_SOURCE else "❌"
@@ -178,25 +180,25 @@ async def cmd_start(client, message: Message):
     await message.reply(
         f"🤖 **Bot alive!**\n\n"
         f"{ok_s} Source: `{RESOLVED_SOURCE.title if RESOLVED_SOURCE else 'NOT RESOLVED'}`\n"
-        f"{ok_d} Dest:   `{RESOLVED_DEST.title if RESOLVED_DEST else 'NOT RESOLVED'}`\n\n"
-        f"/ping — test dest channel\n/test — send test post"
+        f"{ok_d} Dest: `{RESOLVED_DEST.title if RESOLVED_DEST else 'NOT RESOLVED'}`\n\n"
+        f"Source ID: `{RESOLVED_SOURCE.id if RESOLVED_SOURCE else 'N/A'}`\n"
+        f"Dest ID: `{RESOLVED_DEST.id if RESOLVED_DEST else 'N/A'}`\n\n"
+        f"/ping — test dest\n/test — test full pipeline"
     )
 
 
-# ── /ping ─────────────────────────────────────────────────────────────────────
 @app.on_message(filters.private & filters.command("ping"))
 async def cmd_ping(client, message: Message):
     if not RESOLVED_DEST:
         await message.reply("❌ Dest not resolved.")
         return
     try:
-        await client.send_message(RESOLVED_DEST.id, "🏓 Ping — dest works!")
-        await message.reply("✅ Ping sent to dest channel!")
+        await client.send_message(RESOLVED_DEST.id, "🏓 Ping!")
+        await message.reply("✅ Ping sent!")
     except Exception as e:
         await message.reply(f"❌ `{e}`")
 
 
-# ── /test — full pipeline test without needing to upload ─────────────────────
 @app.on_message(filters.private & filters.command("test"))
 async def cmd_test(client, message: Message):
     if not RESOLVED_DEST:
@@ -211,39 +213,40 @@ async def cmd_test(client, message: Message):
         class FakeMsg:
             id = 0
         caption, keyboard = formatter.build(meta, FakeMsg())
-
         await client.send_photo(
             chat_id=RESOLVED_DEST.id,
             photo=poster_path,
-            caption=f"🧪 TEST POST\n\n{caption}",
+            caption=f"🧪 TEST\n\n{caption}",
             reply_markup=keyboard,
         )
-        await message.reply("✅ Test post sent to dest channel!")
+        await message.reply("✅ Test post sent!")
     except Exception as e:
         logger.exception("Test failed")
-        await message.reply(f"❌ Test failed:\n`{e}`")
+        await message.reply(f"❌ `{e}`")
 
 
-# ── Start ─────────────────────────────────────────────────────────────────────
+# ── Startup ───────────────────────────────────────────────────────────────────
 async def main():
     global RESOLVED_SOURCE, RESOLVED_DEST
 
     await start_health_server()
     await db.connect()
-    logger.info("🚀 Bot starting…")
 
-    # Register raw handler BEFORE starting the client
+    # IMPORTANT: add raw handler BEFORE client starts
     app.add_handler(RawUpdateHandler(on_raw_update))
+
+    logger.info("🚀 Starting bot…")
 
     async with app:
         me = await app.get_me()
-        logger.info("🤖 Bot: @%s (id=%s)", me.username, me.id)
+        logger.info("🤖 @%s (id=%s)", me.username, me.id)
 
         RESOLVED_SOURCE = await resolve_channel(app, Config.SOURCE_CHANNEL_ID, "SOURCE")
         RESOLVED_DEST   = await resolve_channel(app, Config.DEST_CHANNEL_ID,   "DEST")
 
         if RESOLVED_SOURCE and RESOLVED_DEST:
-            logger.info("✅ Both channels ready! Upload a file to source channel now.")
+            logger.info("✅ Ready! SOURCE=%s DEST=%s", RESOLVED_SOURCE.id, RESOLVED_DEST.id)
+            logger.info("📤 Upload a file to source channel and watch logs...")
         else:
             logger.error("❌ Channel resolution failed!")
 
@@ -258,7 +261,8 @@ if __name__ == "__main__":
             asyncio.run(main())
             break
         except FloodWait as e:
-            logger.warning("⏳ FloodWait %s sec...", e.value)
+            logger.warning("⏳ FloodWait %ss", e.value)
             time.sleep(e.value + 5)
         except KeyboardInterrupt:
             break
+    
